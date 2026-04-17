@@ -118,6 +118,7 @@ export default function (pi: ExtensionAPI) {
 
   // Preview state
   let previewMessageId: number | undefined;
+  let lastPreviewHtml = "";
   let previewFlushTimer: ReturnType<typeof setTimeout> | undefined;
   let typingInterval: ReturnType<typeof setInterval> | undefined;
 
@@ -329,10 +330,12 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function downloadMessageFiles(message: TelegramMessage): Promise<DownloadResult> {
-    const files: InboxFile[] = [];
-    const oversize: Array<{ name: string; size: number }> = [];
+    const downloads: Array<Promise<{
+      file?: InboxFile;
+      oversize?: { name: string; size: number };
+    }>> = [];
 
-    const download = async (
+    const enqueueDownload = (
       fileId: string,
       name: string,
       fileSize: number | undefined,
@@ -342,25 +345,29 @@ export default function (pi: ExtensionAPI) {
       // Pre-flight against Bot API getFile's 20 MB ceiling. If we skip here,
       // the end-user gets a clear "too large" message rather than a silent drop.
       if (fileSize !== undefined && fileSize > TELEGRAM_DOWNLOAD_LIMIT) {
-        oversize.push({ name, size: fileSize });
+        downloads.push(Promise.resolve({ oversize: { name, size: fileSize } }));
         return;
       }
-      try {
-        const path = await downloadFile(config.botToken, fileId, name, TEMP_DIR);
-        files.push({ path, name, isImage, mimeType });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        // Telegram returns "file is too big" when size was unknown up front.
-        if (/too big/i.test(msg)) oversize.push({ name, size: fileSize ?? 0 });
-      }
+
+      downloads.push((async () => {
+        try {
+          const path = await downloadFile(config.botToken, fileId, name, TEMP_DIR);
+          return { file: { path, name, isImage, mimeType } };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          // Telegram returns "file is too big" when size was unknown up front.
+          if (/too big/i.test(msg)) return { oversize: { name, size: fileSize ?? 0 } };
+          return {};
+        }
+      })());
     };
 
     if (message.photo && message.photo.length > 0) {
       const photo = message.photo[message.photo.length - 1]; // highest res
-      await download(photo.file_id, `photo_${message.message_id}.jpg`, photo.file_size, true, "image/jpeg");
+      enqueueDownload(photo.file_id, `photo_${message.message_id}.jpg`, photo.file_size, true, "image/jpeg");
     }
     if (message.document) {
-      await download(
+      enqueueDownload(
         message.document.file_id,
         message.document.file_name || "document",
         message.document.file_size,
@@ -369,7 +376,7 @@ export default function (pi: ExtensionAPI) {
       );
     }
     if (message.video) {
-      await download(
+      enqueueDownload(
         message.video.file_id,
         message.video.file_name || "video.mp4",
         message.video.file_size,
@@ -378,7 +385,7 @@ export default function (pi: ExtensionAPI) {
       );
     }
     if (message.audio) {
-      await download(
+      enqueueDownload(
         message.audio.file_id,
         message.audio.file_name || "audio.mp3",
         message.audio.file_size,
@@ -387,7 +394,7 @@ export default function (pi: ExtensionAPI) {
       );
     }
     if (message.voice) {
-      await download(
+      enqueueDownload(
         message.voice.file_id,
         `voice_${message.message_id}.ogg`,
         message.voice.file_size,
@@ -396,6 +403,9 @@ export default function (pi: ExtensionAPI) {
       );
     }
 
+    const results = await Promise.all(downloads);
+    const files = results.flatMap((result) => result.file ? [result.file] : []);
+    const oversize = results.flatMap((result) => result.oversize ? [result.oversize] : []);
     return { files, oversize };
   }
 
@@ -968,6 +978,7 @@ export default function (pi: ExtensionAPI) {
       previewFlushTimer = undefined;
     }
     previewMessageId = undefined;
+    lastPreviewHtml = "";
     activeTurn = undefined;
     updateStatus(ctx);
 
@@ -1015,18 +1026,22 @@ export default function (pi: ExtensionAPI) {
     const text = extractTextContent(e.message.content);
     if (!text) return;
 
+    const preview = buildPreview(myName, text);
+    if (preview === lastPreviewHtml) return;
+
     // Throttled preview update
     if (previewFlushTimer) clearTimeout(previewFlushTimer);
     previewFlushTimer = setTimeout(async () => {
-      if (!activeTurn || !config.botToken) return;
+      previewFlushTimer = undefined;
+      if (!activeTurn || !config.botToken || preview === lastPreviewHtml) return;
       try {
-        const preview = buildPreview(myName, text);
         if (previewMessageId) {
           await api.editMessageText(activeTurn.chatId, previewMessageId, preview, "HTML");
         } else {
           const sent = await api.sendMessage(activeTurn.chatId, preview, "HTML");
           previewMessageId = sent.message_id;
         }
+        lastPreviewHtml = preview;
       } catch {}
     }, PREVIEW_THROTTLE_MS);
   });
@@ -1040,6 +1055,7 @@ export default function (pi: ExtensionAPI) {
     if (e.message?.role !== "assistant") return;
     const stale = previewMessageId;
     previewMessageId = undefined;
+    lastPreviewHtml = "";
     if (stale !== undefined && activeTurn) {
       await api.deleteMessage(activeTurn.chatId, stale);
     }
