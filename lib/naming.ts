@@ -46,36 +46,45 @@ export function sanitizeName(name: string): string {
  * still resolves to `👒`.
  */
 const CHARACTER_EMOJI: Record<string, string> = {
-  // Straw Hat Pirates
-  luffy: "👒",
-  zoro: "🗡️",
-  sanji: "🔥",
-  nami: "🍊",
-  usopp: "🎯",
-  chopper: "🦌",
-  robin: "📚",
-  franky: "🔩",
-  brook: "💀",
-  jimbei: "🐟",
-  // Other notable pirates / marines
-  ace: "🔥",
-  sabo: "🎩",
-  shanks: "⚔️",
-  law: "🩺",
-  kid: "🧲",
-  buggy: "🤡",
-  boa: "🐍",
-  mihawk: "🦅",
-  whitebeard: "🔱",
-  blackbeard: "🌑",
+  // Straw Hat Pirates — mapped to the profession/role each character
+  // embodies in the story, using human-with-role emojis which read as
+  // actual people and feel less like decorative noise than abstract
+  // objects (hat, sword, fire).
+  luffy: "🦸",       // captain / hero
+  zoro: "🤺",        // swordsman / fencer
+  sanji: "👨‍🍳",     // cook
+  nami: "👩‍✈️",      // navigator
+  usopp: "🥷",       // sniper / shadow role
+  chopper: "👨‍⚕️",   // ship's doctor
+  robin: "🕵️‍♀️",    // archaeologist / investigator
+  franky: "👷",      // shipwright / engineer
+  brook: "🧑‍🎤",    // soul king / musician
+  jimbei: "🏊",      // helmsman / fish-man
+  // Other notable pirates / marines / allies
+  ace: "🧑‍🚒",       // fire user
+  sabo: "🥷",        // revolutionary shadow
+  shanks: "🤺",      // legendary swordsman
+  law: "🧑‍⚕️",        // surgeon of death
+  kid: "🧑‍🏭",       // metal/magnetism worker
+  buggy: "🤡",       // clown
+  boa: "👸",         // empress
+  mihawk: "🗡️",     // the one exception — "world's greatest swordsman" title
+  whitebeard: "👴",  // old man
+  blackbeard: "👨‍⚖️", // warlord / judge figure
   // Ships / flavor
   sunny: "🌞",
   merry: "🐑",
 };
 
+/**
+ * Fallback palette for names not in the canonical table — a diverse
+ * set of role emojis so every session still reads as "a person doing
+ * something" regardless of what the user named it.
+ */
 const FALLBACK_EMOJI_PALETTE = [
-  "⚔️", "🍊", "🎯", "🦌", "📖", "🔧",
-  "🎻", "🐟", "🧭", "🗺️", "⚓", "🏴‍☠️", "💰", "🌊",
+  "👷", "🧑‍🔧", "🧑‍🔬", "🧑‍💻", "🧑‍🎨", "🧑‍🍳",
+  "🧑‍⚕️", "🕵️", "🧑‍🚀", "🧑‍🌾", "🧑‍🏫", "🧑‍⚖️",
+  "🧑‍💼", "🦸", "🧙", "🥷",
 ] as const;
 
 function baseIdentifier(name: string): string {

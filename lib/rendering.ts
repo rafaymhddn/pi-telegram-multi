@@ -1,15 +1,26 @@
 /**
- * Message rendering — Telegram HTML with a session header signature.
+ * Message rendering — Telegram HTML with a session header signature
+ * and a blockquote-wrapped body.
  *
- * Every message from a session starts with a one-line header:
+ * Every reply renders as:
  *
- *   🦊 <b>@zoro</b>            (single-chunk reply)
- *   🦊 <b>@zoro</b> · 1/3       (multi-chunk reply, per chunk)
+ *   🦸 <b>@luffy</b>            (single-chunk)
+ *   <blockquote>body text here
+ *   multiline ok
+ *   </blockquote>
  *
- * A per-session emoji (deterministic from the session name; see
- * `naming.ts:sessionEmoji`) gives instant visual attribution in
- * Telegram's flat timeline. Reading top-down the user can tell who is
- * speaking before parsing any content.
+ * Or on multi-chunk:
+ *
+ *   🦸 <b>@luffy</b> · 1/3
+ *   <blockquote>…</blockquote>
+ *
+ * The emoji-bold name sits on its own line as a free-standing label;
+ * the blockquote gives the body a colored left-border in Telegram's UI,
+ * creating visual separation between messages from different sessions.
+ *
+ * `sessionEmoji(name)` in naming.ts picks a role-based human emoji
+ * (luffy → 🦸, sanji → 👨‍🍳, franky → 👷, …) so each session reads as
+ * a person, not a decoration.
  */
 import { sessionEmoji } from "./naming.ts";
 
@@ -18,47 +29,55 @@ export const MAX_MESSAGE_LENGTH = 4096;
 // Tags that are self-closing / void and must not be tracked on the tag stack.
 const VOID_TAGS = new Set(["br", "hr", "img"]);
 
+// The body is wrapped in <blockquote>…</blockquote>; reserve the wrap
+// length (and the header) from the 4096-char budget so paginated chunks
+// never overshoot after all decorations are applied.
+const BLOCKQUOTE_OPEN = "<blockquote>";
+const BLOCKQUOTE_CLOSE = "</blockquote>";
+const BLOCKQUOTE_OVERHEAD = BLOCKQUOTE_OPEN.length + BLOCKQUOTE_CLOSE.length;
+
 function escapeHtml(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 /**
- * One-line header prepended to every chunk. `idx`/`total` are omitted
- * for single-chunk messages.
+ * Free-standing header line. `idx`/`total` are omitted for single-chunk.
  */
 function buildHeader(sessionName: string, idx?: number, total?: number): string {
   const safe = escapeHtml(sessionName);
   const emoji = sessionEmoji(sessionName);
   if (total === undefined || total <= 1) {
-    return `${emoji} <b>@${safe}</b>\n\n`;
+    return `${emoji} <b>@${safe}</b>\n`;
   }
-  return `${emoji} <b>@${safe}</b> · ${idx}/${total}\n\n`;
+  return `${emoji} <b>@${safe}</b> · ${idx}/${total}\n`;
 }
 
 /**
- * Build the chunked final reply for a session. The header is reserved
- * from the 4096-char budget (worst-case pagination) before chunking the
- * body so no chunk overflows after the header is prepended.
+ * Build the chunked final reply for a session. The header and
+ * blockquote wrap overhead are reserved from the 4096-char budget
+ * (worst-case pagination) before chunking the body.
  */
 export function buildReplyChunks(sessionName: string, markdown: string): string[] {
   const body = renderMarkdownToHtml(markdown);
   const worstCaseHeader = buildHeader(sessionName, 999, 999).length;
-  const bodyLimit = MAX_MESSAGE_LENGTH - worstCaseHeader;
+  const bodyLimit = MAX_MESSAGE_LENGTH - worstCaseHeader - BLOCKQUOTE_OVERHEAD;
 
   const bodyChunks = chunkMessage(body, bodyLimit);
   const total = bodyChunks.length;
-  return bodyChunks.map((chunk, i) => buildHeader(sessionName, i + 1, total) + chunk);
+  return bodyChunks.map((chunk, i) =>
+    buildHeader(sessionName, i + 1, total) + BLOCKQUOTE_OPEN + chunk + BLOCKQUOTE_CLOSE,
+  );
 }
 
 /**
- * Build a single-bubble streaming preview: emoji-bold header + truncated
- * body. No chunk counter since the preview is always one message edited
- * in place.
+ * Build a single-bubble streaming preview: header + blockquote body.
+ * No chunk counter since the preview is always one message edited in
+ * place.
  */
 export function buildPreview(sessionName: string, markdown: string, maxBodyChars = 500): string {
   const trimmedMd = markdown.length > maxBodyChars ? markdown.slice(0, maxBodyChars) + "…" : markdown;
   const body = renderMarkdownToHtml(trimmedMd);
-  return buildHeader(sessionName) + body;
+  return buildHeader(sessionName) + BLOCKQUOTE_OPEN + body + BLOCKQUOTE_CLOSE;
 }
 
 /**

@@ -210,6 +210,11 @@ export default function (pi: ExtensionAPI) {
 
   const api = makeApiClient(() => config.botToken);
 
+  /** Escape arbitrary text for interpolation into HTML-parseMode messages. */
+  function escHtml(s: string): string {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
   // ─── Session Naming ─────────────────────────────────────────────
 
   function getMySessionName(ctx: ExtensionContext): string {
@@ -398,8 +403,8 @@ export default function (pi: ExtensionAPI) {
       if (status === "timeout") {
         await api.sendMessage(
           pending.chatId,
-          `⏱ ${emoji} @${pending.target} · timeout after ${sec}s`,
-          undefined, undefined, threadTo,
+          `⏱ ${emoji} <b>@${escHtml(pending.target)}</b> · <i>timeout after ${sec}s</i>`,
+          "HTML", undefined, threadTo,
         );
       } else if (status === "error") {
         const err = errorMsg && errorMsg.length > DELEGATE_STATUS_EXCERPT_CHARS
@@ -407,8 +412,8 @@ export default function (pi: ExtensionAPI) {
           : errorMsg;
         await api.sendMessage(
           pending.chatId,
-          `⚠ ${emoji} @${pending.target} · ${err ?? "failed"}`,
-          undefined, undefined, threadTo,
+          `⚠ ${emoji} <b>@${escHtml(pending.target)}</b> · <i>${escHtml(err ?? "failed")}</i>`,
+          "HTML", undefined, threadTo,
         );
       }
       // status === "ok": intentionally no bubble.
@@ -582,8 +587,8 @@ export default function (pi: ExtensionAPI) {
         try {
           await api.sendMessage(
             message.chat.id,
-            `→ ${sessionEmoji(routing.targetSession)} @${routing.targetSession}`,
-            undefined, undefined, message.message_id,
+            `→ ${sessionEmoji(routing.targetSession)} <b>@${escHtml(routing.targetSession)}</b>`,
+            "HTML", undefined, message.message_id,
           );
         } catch {}
       }
@@ -1195,8 +1200,8 @@ export default function (pi: ExtensionAPI) {
       try {
         const sent = await api.sendMessage(
           chatId,
-          `→ ${sessionEmoji(target)} @${target} · ${taskExcerpt}`,
-          undefined,
+          `→ ${sessionEmoji(target)} <b>@${escHtml(target)}</b> · <i>${escHtml(taskExcerpt)}</i>`,
+          "HTML",
           undefined,
           rootReplyToMessageId || undefined,
         );
