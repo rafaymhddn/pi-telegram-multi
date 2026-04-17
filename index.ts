@@ -181,6 +181,14 @@ export default function (pi: ExtensionAPI) {
   let pollingPromise: Promise<void> | undefined;
   let replyWatcher: ReturnType<typeof setInterval> | undefined;
   const pendingDelegations = new Map<string, PendingDelegation>();
+  /**
+   * Last chatId we saw from Telegram. Used as a fallback when
+   * telegram_delegate is called outside of an active Telegram turn
+   * (e.g. the user kicked off orchestration from the pi CLI directly).
+   * For DM bots this defaults to `config.allowedUserId` since a
+   * Telegram private-chat id equals the paired user's id.
+   */
+  let lastTelegramChatId: number | undefined;
 
   // Non-leader state
   let inboxWatcher: ReturnType<typeof setInterval> | undefined;
@@ -505,6 +513,11 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (userId !== config.allowedUserId) return;
+
+    // Remember the chat so orchestration dispatched from the pi CLI
+    // (no active Telegram turn) still has a chat to post status /
+    // replies into.
+    lastTelegramChatId = message.chat.id;
 
     // Parse text
     const text = extractText(message.text, message.caption);
@@ -942,6 +955,12 @@ export default function (pi: ExtensionAPI) {
 
     isDefault = registry.sessions[myName]?.isDefault ?? false;
     isConnected = true;
+    // DM chat id = paired user's id (Telegram convention). This seeds
+    // `lastTelegramChatId` so orchestration kicked off from the pi CLI
+    // can post to Telegram before any update has been received.
+    if (lastTelegramChatId === undefined && config.allowedUserId !== undefined) {
+      lastTelegramChatId = config.allowedUserId;
+    }
 
     // Determine leadership
     const amLeader = await ensureLeadership(myName, myPid);
@@ -1129,9 +1148,14 @@ export default function (pi: ExtensionAPI) {
           isError: true,
         };
       }
-      if (!activeTurn) {
+      // Determine the chat to post status / receive replies in. Prefer
+      // the active Telegram turn's chat; fall back to the last Telegram
+      // chat we've seen (or the paired user's DM id). Without any, the
+      // tool can't work because the target has nowhere to post its reply.
+      const chatId = activeTurn?.chatId ?? lastTelegramChatId;
+      if (chatId === undefined) {
         return {
-          content: [{ type: "text", text: "No active Telegram turn — delegate must be called during an orchestration turn." }],
+          content: [{ type: "text", text: "No Telegram chat known — send a message to the bot first (or use /start) so the bridge has a chat to post to." }],
           details: {},
           isError: true,
         };
@@ -1158,8 +1182,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const correlationId = `dlg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-      const chatId = activeTurn.chatId;
-      const rootReplyToMessageId = activeTurn.replyToMessageId;
+      const rootReplyToMessageId = activeTurn?.replyToMessageId ?? 0;
       const startedAt = Date.now();
       const timeoutSec = params.timeoutSeconds ?? DEFAULT_DELEGATE_TIMEOUT_S;
 
