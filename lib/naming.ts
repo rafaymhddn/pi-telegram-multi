@@ -31,23 +31,65 @@ export function sanitizeName(name: string): string {
 }
 
 /**
- * Deterministic per-session emoji. Same `name` always hashes to the
- * same glyph so users learn `👒 = luffy` across messages without any
- * configuration. Palette: One Piece / pirate crew vibes — straw hat
- * crew attributes (hat, swords, fire, mikan, bullseye, reindeer, book,
- * wrench, violin, fish) plus classic pirate flavor (compass, map,
- * anchor, jolly roger, treasure, wave). Works for any session name,
- * not just One Piece ones; the theme just gives it personality.
+ * Per-session emoji. Two-tier lookup:
+ *
+ *   1. Canonical table — if the session name (case-insensitive) is a
+ *      One Piece / classic anime character, use its iconic emoji. This
+ *      gives the stable mapping users expect: `👒 = luffy` always,
+ *      `🗡️ = zoro` always, regardless of machine or process.
+ *
+ *   2. Hash fallback — for unknown names, djb2-hash into a pirate-
+ *      themed palette so every session still gets a stable glyph.
+ *
+ * Lookup is by the name's base identifier (lowercase, ignoring any
+ * trailing `_1234` suffix from auto-generated names), so `luffy_4821`
+ * still resolves to `👒`.
  */
-const SESSION_EMOJI_PALETTE = [
-  "👒", "⚔️", "🔥", "🍊", "🎯", "🦌", "📖", "🔧",
+const CHARACTER_EMOJI: Record<string, string> = {
+  // Straw Hat Pirates
+  luffy: "👒",
+  zoro: "🗡️",
+  sanji: "🔥",
+  nami: "🍊",
+  usopp: "🎯",
+  chopper: "🦌",
+  robin: "📚",
+  franky: "🔩",
+  brook: "💀",
+  jimbei: "🐟",
+  // Other notable pirates / marines
+  ace: "🔥",
+  sabo: "🎩",
+  shanks: "⚔️",
+  law: "🩺",
+  kid: "🧲",
+  buggy: "🤡",
+  boa: "🐍",
+  mihawk: "🦅",
+  whitebeard: "🔱",
+  blackbeard: "🌑",
+  // Ships / flavor
+  sunny: "🌞",
+  merry: "🐑",
+};
+
+const FALLBACK_EMOJI_PALETTE = [
+  "⚔️", "🍊", "🎯", "🦌", "📖", "🔧",
   "🎻", "🐟", "🧭", "🗺️", "⚓", "🏴‍☠️", "💰", "🌊",
 ] as const;
 
+function baseIdentifier(name: string): string {
+  return name.toLowerCase().replace(/_\d+$/, "");
+}
+
 export function sessionEmoji(name: string): string {
+  const base = baseIdentifier(name);
+  const canonical = CHARACTER_EMOJI[base];
+  if (canonical) return canonical;
+
   let h = 5381;
   for (let i = 0; i < name.length; i++) {
     h = ((h * 33) ^ name.charCodeAt(i)) >>> 0;
   }
-  return SESSION_EMOJI_PALETTE[h % SESSION_EMOJI_PALETTE.length];
+  return FALLBACK_EMOJI_PALETTE[h % FALLBACK_EMOJI_PALETTE.length];
 }

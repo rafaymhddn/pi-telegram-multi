@@ -103,9 +103,15 @@ telegram_delegate is ASYNCHRONOUS and NON-BLOCKING:
 - Each turn's system prompt begins with a "Pending delegations" block that is the authoritative list of what is still in flight. Trust it over your memory.
 - You may dispatch MULTIPLE delegations in a single turn (fan-out). Each reply will arrive as its own later turn; aggregate when you have enough to answer.
 - If the user interjects with an unrelated question while delegations are pending, answer them directly — the pending delegations keep running and their replies still arrive as follow-up turns.
-- Each delegation is visible to the user on Telegram: "→ 🦊 @target · …" on dispatch, "✓ @target · Xs" / "⚠ @target · err" / "⏱ @target · timeout" on conclusion (threaded under the dispatch bubble), plus the target's own full reply headed by its own emoji-bold signature.
+- Each delegation is visible to the user on Telegram: "→ 🦊 @target · task" on dispatch, then the target's own full reply (emoji-headed, threaded under the dispatch bubble) when it finishes. Failure/timeout add a "⚠ …" or "⏱ …" bubble; successful replies do NOT get a separate "done" bubble because the reply itself is the signal.
 - Do not delegate to yourself. If a target session is unknown, tell the user instead of guessing.
-- Orchestration history is logged at ~/.pi/agent/telegram-multi/orchestration-log.md with DISPATCH/RESULT entries. You may read it if the user asks about past delegations.`;
+- Orchestration history is logged at ~/.pi/agent/telegram-multi/orchestration-log.md with DISPATCH/RESULT entries. You may read it if the user asks about past delegations.
+
+KEEP THE CHAT QUIET — the user sees every message:
+- Do NOT quote or forward what a target said. The user already saw the target's reply with its own signature and threading. Repeating it ("@zoro says: …") is pure noise.
+- Do NOT post filler interim messages like "OK, I'll ask them" or "I told @zoro and @sanji". If you have nothing to add, just dispatch the delegations and let the tool's status bubble speak for you — end your turn with no text.
+- DO speak up when you have real value to add: synthesising across replies ("@zoro and @sanji agree, but @nami disagrees because …"), flagging a blocker, answering a direct user question, asking for a decision, or summarising once ALL expected replies are in.
+- If the user explicitly asks "what did they say?" or similar, you may quote — that's value, not noise.`;
 
 // --- Types ---
 
@@ -372,25 +378,22 @@ export default function (pi: ExtensionAPI) {
     const durationMs = Date.now() - pending.startedAt;
     const sec = (durationMs / 1000).toFixed(1);
 
-    // Closing status bubble — threads under the dispatch bubble so the
-    // whole lifecycle (dispatch → target reply → close) sits in one
-    // Telegram thread.
+    // Closing status bubble. On success we skip it entirely — the
+    // target's own full reply (already posted, threaded under the
+    // dispatch bubble, signed with its emoji header) is the completion
+    // signal. A separate "✓ done" adds noise without information. Only
+    // post on failure/timeout, where the user would otherwise have no
+    // visible cue.
     const emoji = sessionEmoji(pending.target);
     const threadTo = pending.dispatchMessageId;
     try {
-      if (status === "ok") {
-        await api.sendMessage(
-          pending.chatId,
-          `✓ ${emoji} @${pending.target} · ${sec}s`,
-          undefined, undefined, threadTo,
-        );
-      } else if (status === "timeout") {
+      if (status === "timeout") {
         await api.sendMessage(
           pending.chatId,
           `⏱ ${emoji} @${pending.target} · timeout after ${sec}s`,
           undefined, undefined, threadTo,
         );
-      } else {
+      } else if (status === "error") {
         const err = errorMsg && errorMsg.length > DELEGATE_STATUS_EXCERPT_CHARS
           ? errorMsg.slice(0, DELEGATE_STATUS_EXCERPT_CHARS - 1) + "…"
           : errorMsg;
@@ -400,6 +403,7 @@ export default function (pi: ExtensionAPI) {
           undefined, undefined, threadTo,
         );
       }
+      // status === "ok": intentionally no bubble.
     } catch {}
 
     void logDelegationResult({
