@@ -6,10 +6,9 @@
  *
  * File: ~/.pi/agent/telegram-multi/inbox/<session-name>.jsonl
  */
-import { mkdir, readFile, writeFile, appendFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
-import { existsSync } from "node:fs";
 import { MULTI_DIR } from "./registry.ts";
+import { appendJsonlRecord, readAndDrainJsonlRecords, removeQueueFile } from "./jsonl-queue.ts";
 
 export interface InboxMessage {
   id: string;
@@ -37,41 +36,20 @@ function inboxPath(sessionName: string): string {
  * Write a message to a session's inbox.
  */
 export async function writeToInbox(sessionName: string, msg: InboxMessage): Promise<void> {
-  await mkdir(INBOX_DIR, { recursive: true });
-  const line = JSON.stringify(msg) + "\n";
-  await appendFile(inboxPath(sessionName), line, "utf8");
+  await appendJsonlRecord(inboxPath(sessionName), msg);
 }
 
 /**
  * Read and drain all messages from a session's inbox.
- * Returns messages in order. Clears the file after reading.
+ * Returns messages in FIFO order using an atomic rename-on-drain snapshot.
  */
 export async function readAndClearInbox(sessionName: string): Promise<InboxMessage[]> {
-  const path = inboxPath(sessionName);
-  if (!existsSync(path)) return [];
-
-  try {
-    const content = await readFile(path, "utf8");
-    // Clear immediately
-    await writeFile(path, "", "utf8");
-
-    return content
-      .trim()
-      .split("\n")
-      .filter((line) => line.trim().length > 0)
-      .map((line) => JSON.parse(line) as InboxMessage);
-  } catch {
-    return [];
-  }
+  return readAndDrainJsonlRecords<InboxMessage>(inboxPath(sessionName));
 }
 
 /**
  * Remove inbox file (on disconnect).
  */
 export async function removeInbox(sessionName: string): Promise<void> {
-  try {
-    await unlink(inboxPath(sessionName));
-  } catch {
-    // ignore
-  }
+  await removeQueueFile(inboxPath(sessionName));
 }
