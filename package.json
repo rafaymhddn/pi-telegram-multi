@@ -1,0 +1,6 @@
+{
+  "name": "pi-telegram-multi",
+  "version": "0.1.0",
+  "description": "Multi-session Telegram bridge for pi — one bot, many sessions",
+  "private": true
+}
