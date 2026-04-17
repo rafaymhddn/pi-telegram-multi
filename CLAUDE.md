@@ -89,7 +89,16 @@ On every leader turn, `before_agent_start` appends a `Pending delegations (N):` 
 
 ### Reply formatting
 
-Final replies are built by `rendering.ts:buildReplyChunks(sessionName, markdown)`, which renders markdown→HTML once, chunks it with the HTML-aware `chunkMessage` (preserves tag balance across chunks, never splits inside tags/entities/surrogate pairs), and appends a trailing `--session_name` footer — with `(i/N)` pagination when multi-chunk. Streaming previews use `buildPreview` (same footer, single bubble edited in place). `renderMarkdownToHtml` is a hand-rolled minimal converter supporting bold/italic/code/links/headers.
+Final replies are built by `rendering.ts:buildReplyChunks(sessionName, markdown)`, which renders markdown→HTML once, chunks it with the HTML-aware `chunkMessage` (preserves tag balance across chunks, never splits inside tags/entities/surrogate pairs), and prepends a **leading header** on every chunk: `{emoji} <b>@session</b>` (plus ` · i/N` on multi-chunk). The worst-case header length is reserved from the 4096-char budget before chunking. Streaming previews use `buildPreview` (same header, single bubble edited in place). The per-session emoji is a deterministic hash of the session name into a 16-emoji neutral palette (`naming.ts:sessionEmoji`) so the same session always gets the same glyph — zero config, works for any domain.
+
+### Threaded messages
+
+Messages use Telegram's `reply_to_message_id` to surface the orchestration tree in the UI:
+- The leader's final reply threads under the user's original message.
+- Each `telegram_delegate` dispatch bubble (`→ 🦊 @target · …`) threads under the user's message too; its `message_id` is captured on `PendingDelegation.dispatchMessageId`.
+- The target's full reply and the closing `✓/⚠/⏱` status bubble thread under the dispatch bubble.
+- Subsequent leader turns triggered by injected `[delegation-reply …]` messages thread under the user's original message via `PendingDelegation.rootReplyToMessageId`.
+All via a single `replyToMessageId?` positional on `lib/api.ts:sendMessage/sendDocument` with `allow_sending_without_reply: true` for deleted-parent tolerance.
 
 ## Config
 

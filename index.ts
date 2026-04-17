@@ -11,8 +11,8 @@
  *   /sessions         → list connected sessions
  *   /stop             → abort current turn
  *
- * Each session signs its replies with a trailing `--session_name` footer
- * (plus `(i/N)` pagination on multi-chunk replies).
+ * Each session signs its replies with a leading emoji+bold header
+ * `<emoji> @session_name` (plus `· i/N` pagination on multi-chunk replies).
  */
 
 import { mkdir, readdir, stat, unlink } from "node:fs/promises";
@@ -60,7 +60,7 @@ import {
 
 import { logTurnStart, logDelegationDispatch, logDelegationResult, logTurnEnd } from "./lib/history.ts";
 
-import { resolveSessionName, sanitizeName } from "./lib/naming.ts";
+import { resolveSessionName, sanitizeName, sessionEmoji } from "./lib/naming.ts";
 import { routeMessage, parseBotCommand, extractText } from "./lib/router.ts";
 import { buildReplyChunks, buildPreview, chunkMessage } from "./lib/rendering.ts";
 
@@ -103,7 +103,7 @@ telegram_delegate is ASYNCHRONOUS and NON-BLOCKING:
 - Each turn's system prompt begins with a "Pending delegations" block that is the authoritative list of what is still in flight. Trust it over your memory.
 - You may dispatch MULTIPLE delegations in a single turn (fan-out). Each reply will arrive as its own later turn; aggregate when you have enough to answer.
 - If the user interjects with an unrelated question while delegations are pending, answer them directly — the pending delegations keep running and their replies still arrive as follow-up turns.
-- Each delegation is visible to the user on Telegram: "→ @target: …" on dispatch, "✓ @target done" / "⚠ @target: err" / "⏱ @target timeout" on conclusion, plus the target's own full reply signed with its --name footer.
+- Each delegation is visible to the user on Telegram: "→ 🦊 @target · …" on dispatch, "✓ @target · Xs" / "⚠ @target · err" / "⏱ @target · timeout" on conclusion (threaded under the dispatch bubble), plus the target's own full reply headed by its own emoji-bold signature.
 - Do not delegate to yourself. If a target session is unknown, tell the user instead of guessing.
 - Orchestration history is logged at ~/.pi/agent/telegram-multi/orchestration-log.md with DISPATCH/RESULT entries. You may read it if the user asks about past delegations.`;
 
@@ -141,6 +141,20 @@ interface PendingDelegation {
   timeoutHandle: ReturnType<typeof setTimeout>;
   /** Chat where the originating `@leader` message came from; replies post here. */
   chatId: number;
+  /**
+   * `message_id` of the "→ @target" dispatch status bubble. The target
+   * session's full reply and this delegation's closing ✓/⚠/⏱ status
+   * all thread under it in Telegram's UI.
+   */
+  dispatchMessageId?: number;
+  /**
+   * `message_id` of the user's original @leader request. The leader's
+   * later aggregated reply (triggered by an injected follow-up turn)
+   * threads under this so the whole orchestration sits in one tree.
+   * 0 means "no threading" (e.g. delegation was initiated from a
+   * reply-injected turn with synthetic message_id = 0).
+   */
+  rootReplyToMessageId: number;
 }
 
 /** Pending delegations block cap so the system prompt doesn't blow up. */
@@ -204,10 +218,15 @@ export default function (pi: ExtensionAPI) {
    * new one — this avoids the duplicate "streaming preview + final reply"
    * bubble pair. Subsequent chunks (if any) are sent as new messages.
    *
-   * Each chunk carries a trailing `--session_name` footer; multi-chunk
-   * replies also include `(i/N)` pagination.
+   * Each chunk begins with the session's emoji-bold header (`@name`
+   * plus `· i/N` on multi-chunk).
    */
-  async function deliverFinalReply(chatId: number, text: string, editMessageId?: number): Promise<void> {
+  async function deliverFinalReply(
+    chatId: number,
+    text: string,
+    editMessageId?: number,
+    replyToMessageId?: number,
+  ): Promise<void> {
     const chunks = buildReplyChunks(myName, text);
     let startIdx = 0;
     if (editMessageId !== undefined && chunks.length > 0) {
@@ -220,7 +239,11 @@ export default function (pi: ExtensionAPI) {
       }
     }
     for (let i = startIdx; i < chunks.length; i++) {
-      await api.sendMessage(chatId, chunks[i], "HTML");
+      // Only the first newly-sent chunk threads under the user's source
+      // message — subsequent chunks post inline right after to avoid
+      // "replying to X" banner repetition on every page.
+      const replyTo = i === startIdx ? replyToMessageId : undefined;
+      await api.sendMessage(chatId, chunks[i], "HTML", undefined, replyTo);
     }
   }
 
@@ -349,17 +372,33 @@ export default function (pi: ExtensionAPI) {
     const durationMs = Date.now() - pending.startedAt;
     const sec = (durationMs / 1000).toFixed(1);
 
-    // Closing status bubble.
+    // Closing status bubble — threads under the dispatch bubble so the
+    // whole lifecycle (dispatch → target reply → close) sits in one
+    // Telegram thread.
+    const emoji = sessionEmoji(pending.target);
+    const threadTo = pending.dispatchMessageId;
     try {
       if (status === "ok") {
-        await api.sendMessage(pending.chatId, `✓ @${pending.target} done (${sec}s)`);
+        await api.sendMessage(
+          pending.chatId,
+          `✓ ${emoji} @${pending.target} · ${sec}s`,
+          undefined, undefined, threadTo,
+        );
       } else if (status === "timeout") {
-        await api.sendMessage(pending.chatId, `⏱ @${pending.target} timeout after ${sec}s`);
+        await api.sendMessage(
+          pending.chatId,
+          `⏱ ${emoji} @${pending.target} · timeout after ${sec}s`,
+          undefined, undefined, threadTo,
+        );
       } else {
         const err = errorMsg && errorMsg.length > DELEGATE_STATUS_EXCERPT_CHARS
           ? errorMsg.slice(0, DELEGATE_STATUS_EXCERPT_CHARS - 1) + "…"
           : errorMsg;
-        await api.sendMessage(pending.chatId, `⚠ @${pending.target}: ${err ?? "failed"}`);
+        await api.sendMessage(
+          pending.chatId,
+          `⚠ ${emoji} @${pending.target} · ${err ?? "failed"}`,
+          undefined, undefined, threadTo,
+        );
       }
     } catch {}
 
@@ -388,11 +427,12 @@ export default function (pi: ExtensionAPI) {
       : (errorMsg ?? (status === "timeout" ? `no reply after ${pending.timeoutSec}s` : "failed"));
     const injected = `${header}\n\n${body}`;
 
-    // Synthetic source message — only chat.id and message_id are consumed
-    // downstream, so a minimal stub is enough.
+    // Synthetic source message — message_id is re-used downstream as the
+    // injected turn's activeTurn.replyToMessageId so the leader's later
+    // aggregated reply threads under the user's original request.
     const pseudo = {
       chat: { id: pending.chatId, type: "private" },
-      message_id: 0,
+      message_id: pending.rootReplyToMessageId || 0,
     } as TelegramMessage;
 
     await dispatchToLocalAgent(injected, pseudo, [], ctx);
@@ -520,7 +560,15 @@ export default function (pi: ExtensionAPI) {
         timestamp: Date.now(),
       });
       if (routing.explicit) {
-        await sendPlainReply(message.chat.id, `→ @${routing.targetSession}`);
+        // Thread the routing ack under the user's message for consistency
+        // with the rest of the UI.
+        try {
+          await api.sendMessage(
+            message.chat.id,
+            `→ ${sessionEmoji(routing.targetSession)} @${routing.targetSession}`,
+            undefined, undefined, message.message_id,
+          );
+        } catch {}
       }
     }
   }
@@ -1107,23 +1155,35 @@ export default function (pi: ExtensionAPI) {
 
       const correlationId = `dlg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       const chatId = activeTurn.chatId;
+      const rootReplyToMessageId = activeTurn.replyToMessageId;
       const startedAt = Date.now();
       const timeoutSec = params.timeoutSeconds ?? DEFAULT_DELEGATE_TIMEOUT_S;
 
       // Transparent status bubble — user sees the delegation kick off.
+      // Thread it under the user's triggering message for a clean tree.
       const taskExcerpt = params.task.length > DELEGATE_STATUS_EXCERPT_CHARS
         ? params.task.slice(0, DELEGATE_STATUS_EXCERPT_CHARS - 1) + "…"
         : params.task;
+      let dispatchMessageId: number | undefined;
       try {
-        await api.sendMessage(chatId, `→ @${target}: ${taskExcerpt}`);
+        const sent = await api.sendMessage(
+          chatId,
+          `→ ${sessionEmoji(target)} @${target} · ${taskExcerpt}`,
+          undefined,
+          undefined,
+          rootReplyToMessageId || undefined,
+        );
+        dispatchMessageId = sent.message_id;
       } catch {}
 
-      // Write to target's inbox.
+      // Write to target's inbox. Its final reply threads under the
+      // dispatch bubble (if we got one), making the per-target reply
+      // tree visible in Telegram.
       try {
         await writeToInbox(target, {
           id: correlationId,
           chatId,
-          replyToMessageId: activeTurn.replyToMessageId,
+          replyToMessageId: dispatchMessageId ?? rootReplyToMessageId,
           text: params.task,
           files: [],
           timestamp: startedAt,
@@ -1167,6 +1227,8 @@ export default function (pi: ExtensionAPI) {
         timeoutSec,
         timeoutHandle,
         chatId,
+        dispatchMessageId,
+        rootReplyToMessageId,
       });
 
       void logDelegationDispatch({
@@ -1342,10 +1404,15 @@ export default function (pi: ExtensionAPI) {
     const finalText = isError ? "Error processing request." : (text ?? "");
 
     // Final reply — edit the streaming preview in place if one exists.
+    // When sending fresh chunks, thread under whatever message triggered
+    // this turn (the user's original message for a direct turn; the
+    // dispatch bubble for a delegated turn; the root for an injected
+    // reply turn). 0 → undefined so the API call omits reply_to.
+    const threadTo = turn.replyToMessageId || undefined;
     if (isError) {
-      await deliverFinalReply(turn.chatId, finalText, editTarget);
+      await deliverFinalReply(turn.chatId, finalText, editTarget, threadTo);
     } else if (text) {
-      await deliverFinalReply(turn.chatId, text, editTarget);
+      await deliverFinalReply(turn.chatId, text, editTarget, threadTo);
     } else if (editTarget !== undefined) {
       // No final text but we had a preview — remove the stale bubble.
       await api.deleteMessage(turn.chatId, editTarget);
@@ -1371,11 +1438,11 @@ export default function (pi: ExtensionAPI) {
       void logTurnEnd({ session: myName, replyText: finalText });
     }
 
-    // Send queued attachments
+    // Send queued attachments, threaded under this turn's trigger.
     for (const filePath of turn.queuedAttachments) {
       try {
         const name = basename(filePath);
-        await api.sendDocument(turn.chatId, filePath, name);
+        await api.sendDocument(turn.chatId, filePath, name, undefined, threadTo);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         await sendPlainReply(turn.chatId, `Failed to send attachment: ${msg}`);
@@ -1411,7 +1478,14 @@ export default function (pi: ExtensionAPI) {
         if (previewMessageId) {
           await api.editMessageText(activeTurn.chatId, previewMessageId, preview, "HTML");
         } else {
-          const sent = await api.sendMessage(activeTurn.chatId, preview, "HTML");
+          const previewThreadTo = activeTurn.replyToMessageId || undefined;
+          const sent = await api.sendMessage(
+            activeTurn.chatId,
+            preview,
+            "HTML",
+            undefined,
+            previewThreadTo,
+          );
           previewMessageId = sent.message_id;
         }
         lastPreviewHtml = preview;

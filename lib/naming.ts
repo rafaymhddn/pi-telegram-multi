@@ -29,3 +29,25 @@ export function sanitizeName(name: string): string {
     .replace(/^_|_$/g, "")
     .slice(0, 48);
 }
+
+/**
+ * Deterministic per-session emoji. Same `name` always hashes to the
+ * same glyph so users learn `👒 = luffy` across messages without any
+ * configuration. Palette: One Piece / pirate crew vibes — straw hat
+ * crew attributes (hat, swords, fire, mikan, bullseye, reindeer, book,
+ * wrench, violin, fish) plus classic pirate flavor (compass, map,
+ * anchor, jolly roger, treasure, wave). Works for any session name,
+ * not just One Piece ones; the theme just gives it personality.
+ */
+const SESSION_EMOJI_PALETTE = [
+  "👒", "⚔️", "🔥", "🍊", "🎯", "🦌", "📖", "🔧",
+  "🎻", "🐟", "🧭", "🗺️", "⚓", "🏴‍☠️", "💰", "🌊",
+] as const;
+
+export function sessionEmoji(name: string): string {
+  let h = 5381;
+  for (let i = 0; i < name.length; i++) {
+    h = ((h * 33) ^ name.charCodeAt(i)) >>> 0;
+  }
+  return SESSION_EMOJI_PALETTE[h % SESSION_EMOJI_PALETTE.length];
+}

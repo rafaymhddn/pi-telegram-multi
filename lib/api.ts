@@ -266,11 +266,22 @@ export function makeApiClient(getToken: () => string | undefined) {
         allowed_updates: ["message", "callback_query"],
       }, signal),
 
-    sendMessage: (chatId: number, text: string, parseMode?: string, signal?: AbortSignal) =>
+    sendMessage: (
+      chatId: number,
+      text: string,
+      parseMode?: string,
+      signal?: AbortSignal,
+      replyToMessageId?: number,
+    ) =>
       callApi<TelegramSentMessage>(getToken(), "sendMessage", {
         chat_id: chatId,
         text,
         ...(parseMode ? { parse_mode: parseMode } : {}),
+        // `allow_sending_without_reply` ensures we still post if the
+        // referenced message was deleted by the user.
+        ...(replyToMessageId
+          ? { reply_to_message_id: replyToMessageId, allow_sending_without_reply: true }
+          : {}),
       }, signal),
 
     editMessageText: (chatId: number, messageId: number, text: string, parseMode?: string, signal?: AbortSignal) =>
@@ -287,9 +298,18 @@ export function makeApiClient(getToken: () => string | undefined) {
         message_id: messageId,
       }, signal).catch(() => false as boolean),
 
-    sendDocument: (chatId: number, filePath: string, fileName: string, signal?: AbortSignal) =>
+    sendDocument: (
+      chatId: number,
+      filePath: string,
+      fileName: string,
+      signal?: AbortSignal,
+      replyToMessageId?: number,
+    ) =>
       callMultipartApi<TelegramSentMessage>(getToken(), "sendDocument", {
         chat_id: String(chatId),
+        ...(replyToMessageId
+          ? { reply_to_message_id: String(replyToMessageId), allow_sending_without_reply: "true" }
+          : {}),
       }, "document", filePath, fileName, signal),
 
     sendChatAction: (chatId: number, action: string, signal?: AbortSignal) =>

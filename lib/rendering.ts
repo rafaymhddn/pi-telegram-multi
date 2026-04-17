@@ -1,6 +1,17 @@
 /**
- * Message rendering — Telegram HTML with session signatures.
+ * Message rendering — Telegram HTML with a session header signature.
+ *
+ * Every message from a session starts with a one-line header:
+ *
+ *   🦊 <b>@zoro</b>            (single-chunk reply)
+ *   🦊 <b>@zoro</b> · 1/3       (multi-chunk reply, per chunk)
+ *
+ * A per-session emoji (deterministic from the session name; see
+ * `naming.ts:sessionEmoji`) gives instant visual attribution in
+ * Telegram's flat timeline. Reading top-down the user can tell who is
+ * speaking before parsing any content.
  */
+import { sessionEmoji } from "./naming.ts";
 
 export const MAX_MESSAGE_LENGTH = 4096;
 
@@ -12,42 +23,42 @@ function escapeHtml(text: string): string {
 }
 
 /**
- * Build the chunked final reply for a session. Each chunk carries the
- * session signature as a trailing footer in the form:
- *
- *   --session_name              (single-chunk reply)
- *   --session_name (i/N)        (multi-chunk reply, per chunk)
- *
- * The body is rendered to Telegram HTML once, then chunked to fit the
- * 4096-char limit *minus* the worst-case footer length so no chunk overflows.
+ * One-line header prepended to every chunk. `idx`/`total` are omitted
+ * for single-chunk messages.
  */
-export function buildReplyChunks(sessionName: string, markdown: string): string[] {
-  const body = renderMarkdownToHtml(markdown);
-  const safeName = escapeHtml(sessionName);
-  const footer = (idx: number, total: number): string =>
-    total <= 1
-      ? `\n\n<i>--${safeName}</i>`
-      : `\n\n<i>--${safeName} (${idx}/${total})</i>`;
-
-  // Reserve space for the worst-case footer (up to 999/999) so that even
-  // after pagination we never overshoot the 4096-char message limit.
-  const worstCaseFooter = footer(999, 999).length;
-  const bodyLimit = MAX_MESSAGE_LENGTH - worstCaseFooter;
-
-  const bodyChunks = chunkMessage(body, bodyLimit);
-  const total = bodyChunks.length;
-  return bodyChunks.map((chunk, i) => chunk + footer(i + 1, total));
+function buildHeader(sessionName: string, idx?: number, total?: number): string {
+  const safe = escapeHtml(sessionName);
+  const emoji = sessionEmoji(sessionName);
+  if (total === undefined || total <= 1) {
+    return `${emoji} <b>@${safe}</b>\n\n`;
+  }
+  return `${emoji} <b>@${safe}</b> · ${idx}/${total}\n\n`;
 }
 
 /**
- * Build a single-bubble streaming preview: body (truncated for responsiveness)
- * + trailing `--session_name` footer. No chunk counter since the preview is
- * always one message edited in place.
+ * Build the chunked final reply for a session. The header is reserved
+ * from the 4096-char budget (worst-case pagination) before chunking the
+ * body so no chunk overflows after the header is prepended.
+ */
+export function buildReplyChunks(sessionName: string, markdown: string): string[] {
+  const body = renderMarkdownToHtml(markdown);
+  const worstCaseHeader = buildHeader(sessionName, 999, 999).length;
+  const bodyLimit = MAX_MESSAGE_LENGTH - worstCaseHeader;
+
+  const bodyChunks = chunkMessage(body, bodyLimit);
+  const total = bodyChunks.length;
+  return bodyChunks.map((chunk, i) => buildHeader(sessionName, i + 1, total) + chunk);
+}
+
+/**
+ * Build a single-bubble streaming preview: emoji-bold header + truncated
+ * body. No chunk counter since the preview is always one message edited
+ * in place.
  */
 export function buildPreview(sessionName: string, markdown: string, maxBodyChars = 500): string {
   const trimmedMd = markdown.length > maxBodyChars ? markdown.slice(0, maxBodyChars) + "…" : markdown;
   const body = renderMarkdownToHtml(trimmedMd);
-  return `${body}\n\n<i>--${escapeHtml(sessionName)}</i>`;
+  return buildHeader(sessionName) + body;
 }
 
 /**
