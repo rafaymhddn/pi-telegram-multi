@@ -11,10 +11,11 @@
  *   /sessions         → list connected sessions
  *   /stop             → abort current turn
  *
- * Each session signs its replies: [session-name] reply text
+ * Each session signs its replies with a trailing `--session_name` footer
+ * (plus `(i/N)` pagination on multi-chunk replies).
  */
 
-import { mkdir, readFile, stat } from "node:fs/promises";
+import { mkdir, readdir, stat, unlink } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -25,6 +26,7 @@ import {
   type TelegramConfig,
   type TelegramMessage,
   type TelegramUpdate,
+  RateLimitError,
   readTelegramConfig,
   writeTelegramConfig,
   makeApiClient,
@@ -32,9 +34,6 @@ import {
 } from "./lib/api.ts";
 
 import {
-  type SessionEntry,
-  type Registry,
-  MULTI_DIR,
   readRegistry,
   registerSession,
   unregisterSession,
@@ -54,7 +53,7 @@ import {
 
 import { resolveSessionName, sanitizeName } from "./lib/naming.ts";
 import { routeMessage, parseBotCommand, extractText } from "./lib/router.ts";
-import { signReply, chunkMessage, MAX_MESSAGE_LENGTH } from "./lib/rendering.ts";
+import { buildReplyChunks, buildPreview, chunkMessage } from "./lib/rendering.ts";
 
 // --- Constants ---
 
@@ -66,6 +65,9 @@ const INBOX_POLL_INTERVAL_MS = 2000;
 const LEADER_CHECK_INTERVAL_MS = 15000;
 const MAX_ATTACHMENTS_PER_TURN = 10;
 const PREVIEW_THROTTLE_MS = 750;
+// Telegram Bot API (cloud) limits.
+const TELEGRAM_UPLOAD_LIMIT = 50 * 1024 * 1024; // 50 MB via sendDocument
+const TELEGRAM_DOWNLOAD_LIMIT = 20 * 1024 * 1024; // 20 MB via getFile
 
 const SYSTEM_PROMPT_SUFFIX = `
 
@@ -80,9 +82,7 @@ Telegram bridge extension is active (multi-session).
 interface ActiveTurn {
   chatId: number;
   replyToMessageId: number;
-  sourceMessageIds: number[];
   queuedAttachments: string[];
-  isInboxTurn: boolean; // true if from inbox (non-leader processing)
 }
 
 interface QueuedInboxMessage {
@@ -118,7 +118,6 @@ export default function (pi: ExtensionAPI) {
 
   // Preview state
   let previewMessageId: number | undefined;
-  let previewText = "";
   let previewFlushTimer: ReturnType<typeof setTimeout> | undefined;
   let typingInterval: ReturnType<typeof setInterval> | undefined;
 
@@ -140,9 +139,30 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  async function sendSignedReply(chatId: number, text: string): Promise<void> {
-    const signed = signReply(myName, text);
-    await sendReply(chatId, signed, "HTML");
+  /**
+   * Deliver the final reply. If a preview message is already in the chat,
+   * edit that message in place with the first chunk instead of sending a
+   * new one — this avoids the duplicate "streaming preview + final reply"
+   * bubble pair. Subsequent chunks (if any) are sent as new messages.
+   *
+   * Each chunk carries a trailing `--session_name` footer; multi-chunk
+   * replies also include `(i/N)` pagination.
+   */
+  async function deliverFinalReply(chatId: number, text: string, editMessageId?: number): Promise<void> {
+    const chunks = buildReplyChunks(myName, text);
+    let startIdx = 0;
+    if (editMessageId !== undefined && chunks.length > 0) {
+      try {
+        await api.editMessageText(chatId, editMessageId, chunks[0], "HTML");
+        startIdx = 1;
+      } catch {
+        // Edit failed (e.g. message too old, identical content, HTML parse error):
+        // fall back to sending the first chunk as a new message.
+      }
+    }
+    for (let i = startIdx; i < chunks.length; i++) {
+      await api.sendMessage(chatId, chunks[i], "HTML");
+    }
   }
 
   async function sendPlainReply(chatId: number, text: string): Promise<void> {
@@ -190,6 +210,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function runPollLoop(ctx: ExtensionContext, signal: AbortSignal): Promise<void> {
+    let lastPersistedUpdateId = config.lastUpdateId ?? 0;
     while (!signal.aborted) {
       try {
         const updates = await api.getUpdates((config.lastUpdateId ?? 0) + 1, 30, signal);
@@ -197,11 +218,20 @@ export default function (pi: ExtensionAPI) {
           config.lastUpdateId = update.update_id;
           await handleUpdate(update, ctx);
         }
-        await writeTelegramConfig(AGENT_DIR, CONFIG_PATH, config);
+        const now = config.lastUpdateId ?? 0;
+        if (now !== lastPersistedUpdateId) {
+          await writeTelegramConfig(AGENT_DIR, CONFIG_PATH, config);
+          lastPersistedUpdateId = now;
+        }
       } catch (err) {
         if (signal.aborted) break;
+        if (err instanceof RateLimitError) {
+          updateStatus(ctx, `rate-limited; waiting ${err.retryAfter}s`);
+          await new Promise((r) => setTimeout(r, err.retryAfter * 1000));
+          updateStatus(ctx);
+          continue;
+        }
         const msg = err instanceof Error ? err.message : String(err);
-        // Don't spam errors — just log
         if (!msg.includes("aborted")) {
           updateStatus(ctx, `poll error: ${msg}`);
         }
@@ -253,8 +283,21 @@ export default function (pi: ExtensionAPI) {
 
     const routing = routeMessage(text || "📎 attachment", defaultName, sessionNames);
 
-    // Download any media
-    const files = await downloadMessageFiles(message);
+    // Download any media (skipping files over the Bot API's 20 MB download cap).
+    const { files, oversize } = await downloadMessageFiles(message);
+    if (oversize.length > 0) {
+      const lines = oversize.map(
+        (o) => `• ${o.name}${o.size > 0 ? ` (${(o.size / 1024 / 1024).toFixed(1)} MB)` : ""}`,
+      );
+      await sendPlainReply(
+        message.chat.id,
+        `Can't download — files over 20 MB are blocked by the Telegram Bot API:\n${lines.join("\n")}`,
+      );
+    }
+
+    // If the message had *only* oversize attachments and no text, there's
+    // nothing meaningful left to forward to the agent.
+    if (!text && files.length === 0 && oversize.length > 0) return;
 
     if (routing.targetSession === myName) {
       // Route to self (leader)
@@ -280,35 +323,80 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  async function downloadMessageFiles(message: TelegramMessage): Promise<InboxFile[]> {
+  interface DownloadResult {
+    files: InboxFile[];
+    oversize: Array<{ name: string; size: number }>;
+  }
+
+  async function downloadMessageFiles(message: TelegramMessage): Promise<DownloadResult> {
     const files: InboxFile[] = [];
-    const download = async (fileId: string, name: string, isImage: boolean, mimeType?: string) => {
+    const oversize: Array<{ name: string; size: number }> = [];
+
+    const download = async (
+      fileId: string,
+      name: string,
+      fileSize: number | undefined,
+      isImage: boolean,
+      mimeType?: string,
+    ) => {
+      // Pre-flight against Bot API getFile's 20 MB ceiling. If we skip here,
+      // the end-user gets a clear "too large" message rather than a silent drop.
+      if (fileSize !== undefined && fileSize > TELEGRAM_DOWNLOAD_LIMIT) {
+        oversize.push({ name, size: fileSize });
+        return;
+      }
       try {
-        const path = await downloadFile(config.botToken!, fileId, name, TEMP_DIR);
+        const path = await downloadFile(config.botToken, fileId, name, TEMP_DIR);
         files.push({ path, name, isImage, mimeType });
       } catch (err) {
-        // skip failed downloads
+        const msg = err instanceof Error ? err.message : String(err);
+        // Telegram returns "file is too big" when size was unknown up front.
+        if (/too big/i.test(msg)) oversize.push({ name, size: fileSize ?? 0 });
       }
     };
 
     if (message.photo && message.photo.length > 0) {
       const photo = message.photo[message.photo.length - 1]; // highest res
-      await download(photo.file_id, `photo_${message.message_id}.jpg`, true, "image/jpeg");
+      await download(photo.file_id, `photo_${message.message_id}.jpg`, photo.file_size, true, "image/jpeg");
     }
     if (message.document) {
-      await download(message.document.file_id, message.document.file_name || "document", false, message.document.mime_type);
+      await download(
+        message.document.file_id,
+        message.document.file_name || "document",
+        message.document.file_size,
+        false,
+        message.document.mime_type,
+      );
     }
     if (message.video) {
-      await download(message.video.file_id, message.video.file_name || "video.mp4", false, message.video.mime_type);
+      await download(
+        message.video.file_id,
+        message.video.file_name || "video.mp4",
+        message.video.file_size,
+        false,
+        message.video.mime_type,
+      );
     }
     if (message.audio) {
-      await download(message.audio.file_id, message.audio.file_name || "audio.mp3", false, message.audio.mime_type);
+      await download(
+        message.audio.file_id,
+        message.audio.file_name || "audio.mp3",
+        message.audio.file_size,
+        false,
+        message.audio.mime_type,
+      );
     }
     if (message.voice) {
-      await download(message.voice.file_id, `voice_${message.message_id}.ogg`, false, message.voice.mime_type);
+      await download(
+        message.voice.file_id,
+        `voice_${message.message_id}.ogg`,
+        message.voice.file_size,
+        false,
+        message.voice.mime_type,
+      );
     }
 
-    return files;
+    return { files, oversize };
   }
 
   async function handleBotCommand(
@@ -369,25 +457,10 @@ export default function (pi: ExtensionAPI) {
       }
 
       default:
-        // Unknown command — treat as regular message
-        const text = extractText(message.text, message.caption);
-        if (text) {
-          const sessions = await listSessions();
-          const defaultSession = await getDefaultSession();
-          const routing = routeMessage(text, defaultSession?.name || myName, sessions.map((s) => s.name));
-          if (routing.targetSession === myName) {
-            await dispatchToLocalAgent(routing.text, message, [], ctx);
-          } else {
-            await writeToInbox(routing.targetSession, {
-              id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-              chatId: message.chat.id,
-              replyToMessageId: message.message_id,
-              text: routing.text,
-              files: [],
-              timestamp: Date.now(),
-            });
-          }
-        }
+        await sendPlainReply(
+          message.chat.id,
+          `Unknown command /${name}. Try /sessions, /status, /stop.`,
+        );
     }
   }
 
@@ -421,9 +494,7 @@ export default function (pi: ExtensionAPI) {
     activeTurn = {
       chatId: sourceMessage.chat.id,
       replyToMessageId: sourceMessage.message_id,
-      sourceMessageIds: [sourceMessage.message_id],
       queuedAttachments: [],
-      isInboxTurn: false,
     };
 
     pi.sendUserMessage(promptText);
@@ -476,9 +547,7 @@ export default function (pi: ExtensionAPI) {
       activeTurn = {
         chatId: msg.chatId,
         replyToMessageId: msg.replyToMessageId,
-        sourceMessageIds: [],
         queuedAttachments: [],
-        isInboxTurn: true,
       };
 
       startTypingLoop(ctx, msg.chatId);
@@ -500,6 +569,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("Telegram: promoted to leader — starting polling", "info");
         await startPolling(ctx);
         stopInboxWatcher(); // Leader processes own messages directly
+        stopLeaderCheck();  // No longer need to poll for leadership
       }
     }, LEADER_CHECK_INTERVAL_MS);
   }
@@ -621,6 +691,10 @@ export default function (pi: ExtensionAPI) {
   async function disconnect(ctx: ExtensionContext): Promise<void> {
     if (!isConnected) return;
 
+    // Abort any in-flight pi turn so it doesn't try to reply after we disconnect.
+    try { currentAbort?.(); } catch {}
+    currentAbort = undefined;
+
     await stopPolling();
     stopInboxWatcher();
     stopLeaderCheck();
@@ -630,7 +704,11 @@ export default function (pi: ExtensionAPI) {
     await removeInbox(myName);
 
     activeTurn = undefined;
-    currentAbort = undefined;
+    previewMessageId = undefined;
+    if (previewFlushTimer) {
+      clearTimeout(previewFlushTimer);
+      previewFlushTimer = undefined;
+    }
     isConnected = false;
     isLeader = false;
     isDefault = false;
@@ -693,6 +771,25 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   }
 
+  // ─── Temp-file Cleanup ─────────────────────────────────────────
+
+  async function cleanupTempDir(dir: string, maxAgeMs: number): Promise<void> {
+    const now = Date.now();
+    let entries: string[] = [];
+    try {
+      entries = await readdir(dir);
+    } catch {
+      return;
+    }
+    for (const name of entries) {
+      const full = join(dir, name);
+      try {
+        const s = await stat(full);
+        if (now - s.mtimeMs > maxAgeMs) await unlink(full);
+      } catch {}
+    }
+  }
+
   // ─── Register Tools ─────────────────────────────────────────────
 
   pi.registerTool({
@@ -710,9 +807,10 @@ export default function (pi: ExtensionAPI) {
         };
       }
       for (const p of params.paths) {
+        let size: number;
         try {
-          await stat(p);
-          activeTurn.queuedAttachments.push(p);
+          const s = await stat(p);
+          size = s.size;
         } catch {
           return {
             content: [{ type: "text", text: `File not found: ${p}` }],
@@ -720,6 +818,18 @@ export default function (pi: ExtensionAPI) {
             isError: true,
           };
         }
+        if (size > TELEGRAM_UPLOAD_LIMIT) {
+          const mb = (size / 1024 / 1024).toFixed(1);
+          return {
+            content: [{
+              type: "text",
+              text: `File too large for Telegram (${mb} MB; limit is 50 MB via Bot API): ${p}`,
+            }],
+            details: {},
+            isError: true,
+          };
+        }
+        activeTurn.queuedAttachments.push(p);
       }
       return {
         content: [{ type: "text", text: `Queued ${params.paths.length} file(s) for Telegram delivery.` }],
@@ -793,6 +903,11 @@ export default function (pi: ExtensionAPI) {
           isDefault: isDefault,
           connectedAt: new Date().toISOString(),
         });
+        // Remove the stale inbox file under the old name so it doesn't
+        // accumulate undelivered messages or linger after rename.
+        if (oldName && oldName !== myName) {
+          try { await removeInbox(oldName); } catch {}
+        }
       }
       ctx.ui.notify(`Renamed: @${oldName} → @${myName}`, "info");
       updateStatus(ctx);
@@ -804,6 +919,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     config = await readTelegramConfig(CONFIG_PATH);
     await mkdir(TEMP_DIR, { recursive: true });
+    // Best-effort sweep of old downloads from previous sessions.
+    void cleanupTempDir(TEMP_DIR, 24 * 60 * 60 * 1000);
     updateStatus(ctx);
   });
 
@@ -825,6 +942,11 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", (event, _ctx) => {
     const e = event as { prompt: string; systemPrompt: string };
+    // Idempotent: if pi re-emits the original systemPrompt each turn this
+    // is a no-op; if it accumulates, skip to avoid duplicating the suffix.
+    if (e.systemPrompt.includes("Telegram bridge extension is active")) {
+      return { systemPrompt: e.systemPrompt };
+    }
     const suffix = e.prompt.trimStart().startsWith(TELEGRAM_PREFIX)
       ? `${SYSTEM_PROMPT_SUFFIX}\n- The current user message came from Telegram.`
       : SYSTEM_PROMPT_SUFFIX;
@@ -838,8 +960,14 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_end", async (event, ctx) => {
     const turn = activeTurn;
+    const editTarget = previewMessageId;
     currentAbort = undefined;
     stopTypingLoop();
+    if (previewFlushTimer) {
+      clearTimeout(previewFlushTimer);
+      previewFlushTimer = undefined;
+    }
+    previewMessageId = undefined;
     activeTurn = undefined;
     updateStatus(ctx);
 
@@ -849,11 +977,14 @@ export default function (pi: ExtensionAPI) {
     const text = extractAssistantText(e.messages);
     const stopReason = e.messages[e.messages.length - 1]?.stopReason;
 
-    // Handle errors
+    // Final reply — edit the streaming preview in place if one exists.
     if (stopReason === "error" || (!text && stopReason !== "stop")) {
-      await sendSignedReply(turn.chatId, "Error processing request.");
+      await deliverFinalReply(turn.chatId, "Error processing request.", editTarget);
     } else if (text) {
-      await sendSignedReply(turn.chatId, text);
+      await deliverFinalReply(turn.chatId, text, editTarget);
+    } else if (editTarget !== undefined) {
+      // No final text but we had a preview — remove the stale bubble.
+      await api.deleteMessage(turn.chatId, editTarget);
     }
 
     // Send queued attachments
@@ -889,7 +1020,7 @@ export default function (pi: ExtensionAPI) {
     previewFlushTimer = setTimeout(async () => {
       if (!activeTurn || !config.botToken) return;
       try {
-        const preview = signReply(myName, text.length > 500 ? text.slice(0, 500) + "…" : text);
+        const preview = buildPreview(myName, text);
         if (previewMessageId) {
           await api.editMessageText(activeTurn.chatId, previewMessageId, preview, "HTML");
         } else {
@@ -901,11 +1032,16 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("message_start", async (event, _ctx) => {
-    // Clear preview on new assistant message
+    // Reset the preview anchor on each new assistant message within a turn.
+    // If a preview bubble from a prior assistant message is still in the
+    // chat, delete it so we don't leave orphan previews stacking up when
+    // the agent interleaves text/tool-use messages.
     const e = event as { message: { role?: string } };
-    if (e.message?.role === "assistant") {
-      previewMessageId = undefined;
-      previewText = "";
+    if (e.message?.role !== "assistant") return;
+    const stale = previewMessageId;
+    previewMessageId = undefined;
+    if (stale !== undefined && activeTurn) {
+      await api.deleteMessage(activeTurn.chatId, stale);
     }
   });
 }

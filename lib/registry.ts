@@ -145,11 +145,14 @@ export async function ensureLeadership(myName: string, myPid: number): Promise<b
 }
 
 /**
- * Look up a session by name.
+ * Look up an alive session by name. Returns undefined for unknown or dead sessions.
  */
 export async function findSession(name: string): Promise<SessionEntry | undefined> {
   const registry = await readRegistry();
-  return registry.sessions[name];
+  const entry = registry.sessions[name];
+  if (!entry) return undefined;
+  if (!isPidAlive(entry.pid)) return undefined;
+  return entry;
 }
 
 /**
