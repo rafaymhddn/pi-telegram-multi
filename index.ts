@@ -51,6 +51,15 @@ import {
   removeInbox,
 } from "./lib/inbox.ts";
 
+import {
+  type ReplyRecord,
+  readAndClearReplies,
+  writeReply,
+  removeReplies,
+} from "./lib/replies.ts";
+
+import { logTurnStart, logDelegationDispatch, logDelegationResult, logTurnEnd } from "./lib/history.ts";
+
 import { resolveSessionName, sanitizeName } from "./lib/naming.ts";
 import { routeMessage, parseBotCommand, extractText } from "./lib/router.ts";
 import { buildReplyChunks, buildPreview, chunkMessage } from "./lib/rendering.ts";
@@ -62,9 +71,12 @@ const CONFIG_PATH = join(AGENT_DIR, "telegram.json");
 const TEMP_DIR = join(AGENT_DIR, "tmp", "telegram-multi");
 const TELEGRAM_PREFIX = "[telegram]";
 const INBOX_POLL_INTERVAL_MS = 2000;
+const REPLY_POLL_INTERVAL_MS = 1000;
 const LEADER_CHECK_INTERVAL_MS = 15000;
 const MAX_ATTACHMENTS_PER_TURN = 10;
 const PREVIEW_THROTTLE_MS = 750;
+const DEFAULT_DELEGATE_TIMEOUT_S = 600;
+const DELEGATE_STATUS_EXCERPT_CHARS = 120;
 // Telegram Bot API (cloud) limits.
 const TELEGRAM_UPLOAD_LIMIT = 50 * 1024 * 1024; // 50 MB via sendDocument
 const TELEGRAM_DOWNLOAD_LIMIT = 20 * 1024 * 1024; // 20 MB via getFile
@@ -77,18 +89,62 @@ Telegram bridge extension is active (multi-session).
 - If a [telegram] user asked for a file or generated artifact, use the telegram_attach tool with the local file path so the extension can send it with your next final reply.
 - Do not assume mentioning a local file path in plain text will send it to Telegram. Use telegram_attach.`;
 
+const LEADER_ORCHESTRATION_SUFFIX = `
+
+You are the LEADER of a multi-session Telegram bridge. Live sessions and their cwds are listed below; coordinate them with the telegram_delegate tool.
+
+telegram_delegate is ASYNCHRONOUS and NON-BLOCKING:
+- telegram_delegate({target, task, timeoutSeconds?}) DISPATCHES a subtask and returns immediately with a correlationId. Your turn ends normally after you've finished responding.
+- The target's reply arrives LATER as a new user message prefixed:
+    "[delegation-reply from @target] (task: …)"     — on success
+    "[delegation-error from @target] (task: …)"     — target returned an error
+    "[delegation-timeout from @target] (task: …)"   — timed out (default 600s)
+  When you see one of those prefixes, treat it as input to your orchestration, not a user question.
+- Each turn's system prompt begins with a "Pending delegations" block that is the authoritative list of what is still in flight. Trust it over your memory.
+- You may dispatch MULTIPLE delegations in a single turn (fan-out). Each reply will arrive as its own later turn; aggregate when you have enough to answer.
+- If the user interjects with an unrelated question while delegations are pending, answer them directly — the pending delegations keep running and their replies still arrive as follow-up turns.
+- Each delegation is visible to the user on Telegram: "→ @target: …" on dispatch, "✓ @target done" / "⚠ @target: err" / "⏱ @target timeout" on conclusion, plus the target's own full reply signed with its --name footer.
+- Do not delegate to yourself. If a target session is unknown, tell the user instead of guessing.
+- Orchestration history is logged at ~/.pi/agent/telegram-multi/orchestration-log.md with DISPATCH/RESULT entries. You may read it if the user asks about past delegations.`;
+
 // --- Types ---
 
 interface ActiveTurn {
   chatId: number;
   replyToMessageId: number;
   queuedAttachments: string[];
+  /**
+   * Present when this turn is executing a task delegated by another session.
+   * The final assistant text is mirrored to the delegator's reply-channel
+   * file so their `telegram_delegate` tool-call promise resolves.
+   */
+  delegation?: {
+    correlationId: string;
+    fromSession: string;
+    replyChannel: string;
+  };
+  /** User-facing input excerpt used for history logging. */
+  historyInput?: string;
 }
 
 interface QueuedInboxMessage {
   msg: InboxMessage;
   order: number;
 }
+
+interface PendingDelegation {
+  correlationId: string;
+  target: string;
+  task: string;
+  startedAt: number;
+  timeoutSec: number;
+  timeoutHandle: ReturnType<typeof setTimeout>;
+  /** Chat where the originating `@leader` message came from; replies post here. */
+  chatId: number;
+}
+
+/** Pending delegations block cap so the system prompt doesn't blow up. */
+const MAX_PENDING_IN_PROMPT = 20;
 
 // --- Extension ---
 
@@ -103,6 +159,8 @@ export default function (pi: ExtensionAPI) {
   // Leader state
   let pollingController: AbortController | undefined;
   let pollingPromise: Promise<void> | undefined;
+  let replyWatcher: ReturnType<typeof setInterval> | undefined;
+  const pendingDelegations = new Map<string, PendingDelegation>();
 
   // Non-leader state
   let inboxWatcher: ReturnType<typeof setInterval> | undefined;
@@ -190,15 +248,154 @@ export default function (pi: ExtensionAPI) {
       pollingController = undefined;
       updateStatus(ctx);
     });
+    startReplyWatcher(ctx);
     updateStatus(ctx);
   }
 
   async function stopPolling(): Promise<void> {
     stopTypingLoop();
+    stopReplyWatcher();
     pollingController?.abort();
     pollingController = undefined;
     await pollingPromise?.catch(() => undefined);
     pollingPromise = undefined;
+  }
+
+  // ─── Leader: Reply Channel Watcher ─────────────────────────────
+  //
+  // Delegations are fire-and-forget from the tool's perspective. When a
+  // target session's reply arrives on our reply-channel file, we:
+  //   1) close the status bubble ("✓ @target done" / "⚠ @target: err"),
+  //   2) log a RESULT entry to the orchestration log,
+  //   3) inject a synthetic `[delegation-reply|error|timeout from @target]`
+  //      user message into the leader's pi session so the agent can see the
+  //      result and continue reasoning — potentially dispatching more work
+  //      or summarising.
+  //
+  // Timeout follows the same injection path, keyed off the setTimeout
+  // registered in the `telegram_delegate` tool's execute handler.
+
+  function startReplyWatcher(ctx: ExtensionContext): void {
+    if (replyWatcher) return;
+    replyWatcher = setInterval(async () => {
+      try {
+        const records = await readAndClearReplies(myName);
+        for (const rec of records) {
+          const pending = pendingDelegations.get(rec.correlationId);
+          if (!pending) continue; // leader restart or unknown correlation — drop
+          clearTimeout(pending.timeoutHandle);
+          pendingDelegations.delete(rec.correlationId);
+          await onDelegationResult(
+            ctx,
+            pending,
+            rec.ok ? "ok" : "error",
+            rec.text,
+            rec.error,
+          );
+        }
+      } catch {}
+    }, REPLY_POLL_INTERVAL_MS);
+  }
+
+  function stopReplyWatcher(): void {
+    if (replyWatcher) {
+      clearInterval(replyWatcher);
+      replyWatcher = undefined;
+    }
+    // In-flight delegations on target sessions are NOT cancelled — they
+    // keep running. Their replies, if they arrive after polling stops (or
+    // the leader changes), will hit an empty `pendingDelegations` and be
+    // logged + dropped by a future leader. Clear timers locally.
+    for (const [id, pending] of pendingDelegations) {
+      clearTimeout(pending.timeoutHandle);
+      pendingDelegations.delete(id);
+    }
+  }
+
+  /**
+   * Render the authoritative "Pending delegations" block that gets injected
+   * into the leader's system prompt at the start of every turn. The agent
+   * treats this as the source of truth for what is currently in flight,
+   * so it never forgets outstanding work even across interjected turns.
+   */
+  function renderPendingBlock(): string {
+    const entries = Array.from(pendingDelegations.values()).sort((a, b) => a.startedAt - b.startedAt);
+    if (entries.length === 0) return "Pending delegations: (none)";
+    const now = Date.now();
+    const shown = entries.slice(0, MAX_PENDING_IN_PROMPT);
+    const extra = entries.length - shown.length;
+    const lines = shown.map((p) => {
+      const ageSec = Math.round((now - p.startedAt) / 1000);
+      const task = p.task.length > 160 ? p.task.slice(0, 159) + "…" : p.task;
+      return `  - @${p.target} (${ageSec}s ago, ${p.correlationId}, timeout ${p.timeoutSec}s): "${task}"`;
+    });
+    const suffix = extra > 0 ? `\n  … and ${extra} more` : "";
+    return `Pending delegations (${entries.length}):\n${lines.join("\n")}${suffix}`;
+  }
+
+  /**
+   * Unified "delegation concluded" handler. Posts the closing Telegram
+   * status line, logs the RESULT entry, and injects a follow-up user
+   * message into the leader's pi session via `dispatchToLocalAgent` —
+   * which queues behind any in-flight turn via the existing `leaderQueue`.
+   */
+  async function onDelegationResult(
+    ctx: ExtensionContext,
+    pending: PendingDelegation,
+    status: "ok" | "error" | "timeout",
+    text: string,
+    errorMsg?: string,
+  ): Promise<void> {
+    const durationMs = Date.now() - pending.startedAt;
+    const sec = (durationMs / 1000).toFixed(1);
+
+    // Closing status bubble.
+    try {
+      if (status === "ok") {
+        await api.sendMessage(pending.chatId, `✓ @${pending.target} done (${sec}s)`);
+      } else if (status === "timeout") {
+        await api.sendMessage(pending.chatId, `⏱ @${pending.target} timeout after ${sec}s`);
+      } else {
+        const err = errorMsg && errorMsg.length > DELEGATE_STATUS_EXCERPT_CHARS
+          ? errorMsg.slice(0, DELEGATE_STATUS_EXCERPT_CHARS - 1) + "…"
+          : errorMsg;
+        await api.sendMessage(pending.chatId, `⚠ @${pending.target}: ${err ?? "failed"}`);
+      }
+    } catch {}
+
+    void logDelegationResult({
+      from: myName,
+      to: pending.target,
+      correlationId: pending.correlationId,
+      status,
+      durationMs,
+      resultExcerpt: status === "ok" ? text : undefined,
+      error: status === "ok" ? undefined : (errorMsg ?? status),
+    });
+
+    // Build the injected user message. The agent's system prompt teaches it
+    // to recognise these prefixes.
+    const taskExcerpt = pending.task.length > 160
+      ? pending.task.slice(0, 159) + "…"
+      : pending.task;
+    const header = status === "ok"
+      ? `[delegation-reply from @${pending.target}] (task: "${taskExcerpt}")`
+      : status === "timeout"
+        ? `[delegation-timeout from @${pending.target}] (task: "${taskExcerpt}")`
+        : `[delegation-error from @${pending.target}] (task: "${taskExcerpt}")`;
+    const body = status === "ok"
+      ? (text.trim() || "(empty reply)")
+      : (errorMsg ?? (status === "timeout" ? `no reply after ${pending.timeoutSec}s` : "failed"));
+    const injected = `${header}\n\n${body}`;
+
+    // Synthetic source message — only chat.id and message_id are consumed
+    // downstream, so a minimal stub is enough.
+    const pseudo = {
+      chat: { id: pending.chatId, type: "private" },
+      message_id: 0,
+    } as TelegramMessage;
+
+    await dispatchToLocalAgent(injected, pseudo, [], ctx);
   }
 
   async function registerBotCommands(): Promise<void> {
@@ -282,7 +479,11 @@ export default function (pi: ExtensionAPI) {
     const defaultSession = await getDefaultSession();
     const defaultName = defaultSession?.name || myName;
 
-    const routing = routeMessage(text || "📎 attachment", defaultName, sessionNames);
+    const routing = routeMessage(text || "📎 attachment", {
+      defaultSession: defaultName,
+      leaderSession: myName,
+      knownSessions: sessionNames,
+    });
 
     // Download any media (skipping files over the Bot API's 20 MB download cap).
     const { files, oversize } = await downloadMessageFiles(message);
@@ -505,8 +706,10 @@ export default function (pi: ExtensionAPI) {
       chatId: sourceMessage.chat.id,
       replyToMessageId: sourceMessage.message_id,
       queuedAttachments: [],
+      historyInput: text,
     };
 
+    void logTurnStart({ session: myName, userText: text, via: "telegram" });
     pi.sendUserMessage(promptText);
   }
 
@@ -558,9 +761,16 @@ export default function (pi: ExtensionAPI) {
         chatId: msg.chatId,
         replyToMessageId: msg.replyToMessageId,
         queuedAttachments: [],
+        delegation: msg.delegation,
+        historyInput: msg.text,
       };
 
       startTypingLoop(ctx, msg.chatId);
+      void logTurnStart({
+        session: myName,
+        userText: msg.text,
+        via: msg.delegation ? `delegated by ${msg.delegation.fromSession}` : "inbox",
+      });
       pi.sendUserMessage(promptText);
     } finally {
       processingInbox = false;
@@ -712,6 +922,7 @@ export default function (pi: ExtensionAPI) {
 
     await unregisterSession(myName);
     await removeInbox(myName);
+    await removeReplies(myName);
 
     activeTurn = undefined;
     previewMessageId = undefined;
@@ -848,6 +1059,137 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool({
+    name: "telegram_delegate",
+    label: "Telegram Delegate",
+    description:
+      "Dispatch a subtask to another connected pi session via the Telegram bridge. NON-BLOCKING: returns immediately after dispatch. The target's reply will arrive later as a new user message prefixed '[delegation-reply from @target]' (or -error / -timeout). Leader-only.",
+    parameters: Type.Object({
+      target: Type.String({ description: "Target session name (no @ prefix)." }),
+      task: Type.String({ description: "Instruction to forward to the target session." }),
+      timeoutSeconds: Type.Optional(Type.Number({ minimum: 10, maximum: 3600 })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      if (!isLeader) {
+        return {
+          content: [{ type: "text", text: "telegram_delegate is leader-only. This session is not the leader." }],
+          details: {},
+          isError: true,
+        };
+      }
+      if (!activeTurn) {
+        return {
+          content: [{ type: "text", text: "No active Telegram turn — delegate must be called during an orchestration turn." }],
+          details: {},
+          isError: true,
+        };
+      }
+      const target = params.target.replace(/^@/, "").trim();
+      if (!target) {
+        return { content: [{ type: "text", text: "target is required." }], details: {}, isError: true };
+      }
+      if (target.toLowerCase() === myName.toLowerCase()) {
+        return {
+          content: [{ type: "text", text: "Refusing to delegate to self. Handle the task directly." }],
+          details: {},
+          isError: true,
+        };
+      }
+
+      const found = await findSession(target);
+      if (!found) {
+        return {
+          content: [{ type: "text", text: `Unknown or dead session "@${target}". Use /telegram-status to see live sessions.` }],
+          details: {},
+          isError: true,
+        };
+      }
+
+      const correlationId = `dlg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      const chatId = activeTurn.chatId;
+      const startedAt = Date.now();
+      const timeoutSec = params.timeoutSeconds ?? DEFAULT_DELEGATE_TIMEOUT_S;
+
+      // Transparent status bubble — user sees the delegation kick off.
+      const taskExcerpt = params.task.length > DELEGATE_STATUS_EXCERPT_CHARS
+        ? params.task.slice(0, DELEGATE_STATUS_EXCERPT_CHARS - 1) + "…"
+        : params.task;
+      try {
+        await api.sendMessage(chatId, `→ @${target}: ${taskExcerpt}`);
+      } catch {}
+
+      // Write to target's inbox.
+      try {
+        await writeToInbox(target, {
+          id: correlationId,
+          chatId,
+          replyToMessageId: activeTurn.replyToMessageId,
+          text: params.task,
+          files: [],
+          timestamp: startedAt,
+          delegation: {
+            correlationId,
+            fromSession: myName,
+            replyChannel: myName,
+          },
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text", text: `Failed to write to inbox of @${target}: ${msg}` }],
+          details: {},
+          isError: true,
+        };
+      }
+
+      // Schedule timeout — fires `onDelegationResult` if no reply lands first.
+      const timeoutHandle = setTimeout(() => {
+        const pending = pendingDelegations.get(correlationId);
+        if (!pending) return;
+        pendingDelegations.delete(correlationId);
+        void onDelegationResult(
+          ctx,
+          pending,
+          "timeout",
+          "",
+          `no reply after ${timeoutSec}s`,
+        );
+      }, timeoutSec * 1000);
+      // Node's setTimeout keeps the event loop alive by default. Delegations
+      // should not block graceful shutdown on their own.
+      timeoutHandle.unref?.();
+
+      pendingDelegations.set(correlationId, {
+        correlationId,
+        target,
+        task: params.task,
+        startedAt,
+        timeoutSec,
+        timeoutHandle,
+        chatId,
+      });
+
+      void logDelegationDispatch({
+        from: myName,
+        to: target,
+        task: params.task,
+        correlationId,
+      });
+
+      // Return immediately — the reply arrives later as an injected user message.
+      return {
+        content: [{
+          type: "text",
+          text:
+            `Dispatched to @${target} (correlationId ${correlationId}, timeout ${timeoutSec}s). ` +
+            `You'll receive the reply as a new user message prefixed "[delegation-reply from @${target}]". ` +
+            `Continue with other work; don't block waiting for this.`,
+        }],
+        details: { target, correlationId, status: "dispatched", timeoutSec },
+      };
+    },
+  });
+
   // ─── Register Commands ──────────────────────────────────────────
 
   pi.registerCommand("telegram-setup", {
@@ -942,6 +1284,7 @@ export default function (pi: ExtensionAPI) {
       stopTypingLoop();
       try { await unregisterSession(myName); } catch {}
       try { await removeInbox(myName); } catch {}
+      try { await removeReplies(myName); } catch {}
       activeTurn = undefined;
       currentAbort = undefined;
       isConnected = false;
@@ -950,16 +1293,24 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("before_agent_start", (event, _ctx) => {
+  pi.on("before_agent_start", async (event, _ctx) => {
     const e = event as { prompt: string; systemPrompt: string };
     // Idempotent: if pi re-emits the original systemPrompt each turn this
     // is a no-op; if it accumulates, skip to avoid duplicating the suffix.
     if (e.systemPrompt.includes("Telegram bridge extension is active")) {
       return { systemPrompt: e.systemPrompt };
     }
-    const suffix = e.prompt.trimStart().startsWith(TELEGRAM_PREFIX)
+    let suffix = e.prompt.trimStart().startsWith(TELEGRAM_PREFIX)
       ? `${SYSTEM_PROMPT_SUFFIX}\n- The current user message came from Telegram.`
       : SYSTEM_PROMPT_SUFFIX;
+    if (isLeader && isConnected) {
+      const sessions = await listSessions().catch(() => []);
+      const peerLines = sessions
+        .filter((s) => s.name !== myName)
+        .map((s) => `  - @${s.name} (cwd: ${s.cwd})`);
+      const peers = peerLines.length > 0 ? `\nPeer sessions:\n${peerLines.join("\n")}` : "\nPeer sessions: (none currently connected)";
+      suffix += LEADER_ORCHESTRATION_SUFFIX + peers + "\n" + renderPendingBlock();
+    }
     return { systemPrompt: e.systemPrompt + suffix };
   });
 
@@ -987,15 +1338,37 @@ export default function (pi: ExtensionAPI) {
     const e = event as { messages: Array<{ role?: string; content?: unknown; stopReason?: string; errorMessage?: string }> };
     const text = extractAssistantText(e.messages);
     const stopReason = e.messages[e.messages.length - 1]?.stopReason;
+    const isError = stopReason === "error" || (!text && stopReason !== "stop");
+    const finalText = isError ? "Error processing request." : (text ?? "");
 
     // Final reply — edit the streaming preview in place if one exists.
-    if (stopReason === "error" || (!text && stopReason !== "stop")) {
-      await deliverFinalReply(turn.chatId, "Error processing request.", editTarget);
+    if (isError) {
+      await deliverFinalReply(turn.chatId, finalText, editTarget);
     } else if (text) {
       await deliverFinalReply(turn.chatId, text, editTarget);
     } else if (editTarget !== undefined) {
       // No final text but we had a preview — remove the stale bubble.
       await api.deleteMessage(turn.chatId, editTarget);
+    }
+
+    // Mirror the result to the delegator's reply channel. The delegator's
+    // reply watcher will drain the record and inject a follow-up user
+    // message ("[delegation-reply from @<us>] …") into its own pi session.
+    // Non-fatal on failure.
+    if (turn.delegation) {
+      const rec: ReplyRecord = {
+        correlationId: turn.delegation.correlationId,
+        fromSession: myName,
+        text: finalText,
+        ok: !isError,
+        error: isError ? "target session reported error" : undefined,
+        timestamp: Date.now(),
+      };
+      try { await writeReply(turn.delegation.replyChannel, rec); } catch {}
+    }
+
+    if (turn.historyInput !== undefined) {
+      void logTurnEnd({ session: myName, replyText: finalText });
     }
 
     // Send queued attachments

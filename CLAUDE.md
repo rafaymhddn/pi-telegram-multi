@@ -14,7 +14,9 @@ There is no build step, no test suite, and no linter config. `package.json` is p
 
 All coordination state lives under `~/.pi/agent/telegram-multi/`:
 - `registry.json` — every connected session registers here; records `{sessions, leader, leaderPid}`.
-- `inbox/<session-name>.jsonl` — append-only queue of messages routed *to* a non-leader session.
+- `inbox/<session-name>.jsonl` — append-only queue of messages routed *to* a non-leader session. Messages carry an optional `delegation` field when they originated from the leader's `telegram_delegate` tool rather than from Telegram directly.
+- `replies/<session-name>.jsonl` — reply channel for delegations: a session that processed a delegated task writes its result back here so the leader's reply-channel watcher can drain it and inject a follow-up user message into the leader's own pi session.
+- `orchestration-log.md` — append-only markdown journal of orchestrator turns and delegations (timestamps, tasks, outcomes, durations). The leader can read its own history to answer "what did you ask X to do?".
 
 Liveness is determined by `process.kill(pid, 0)` checks (`registry.ts:isPidAlive`). Dead sessions are garbage-collected on every `registerSession` / `ensureLeadership` call — there is no separate reaper.
 
@@ -31,7 +33,11 @@ Leader election is first-writer-wins via `registerSession` / `ensureLeadership`.
 
 ### Routing
 
-`router.ts:routeMessage` parses a leading `@name` mention against the live `knownSessions` list. Unknown `@mentions` fall through to the default session (the message is **not** stripped in that case). `/sessions`, `/status`, `/stop`, `/start` are handled by the leader directly as bot commands, not routed.
+`router.ts:routeMessage` parses the contiguous leading `@mention` block and returns a `{ targetSession, text, explicit, mode, mentions }` result. Two modes:
+- `direct` — a single `@name` pointing at a non-leader session, or no mentions at all. The target session runs the turn and replies to Telegram itself. Fast path, no leader involvement beyond inbox handoff.
+- `orchestrate` — either an explicit `@leader` single-mention or any multi-mention (`@a @b task`). The leader executes the turn itself, with the `telegram_delegate` tool and an orchestration-flavored system prompt. It decides how to break the request down and calls `telegram_delegate` once per target.
+
+Unknown `@mentions` still fall through to the default session (the message is **not** stripped in that case). `/sessions`, `/status`, `/stop`, `/start` are handled by the leader directly as bot commands, not routed.
 
 The **default session** is whichever session registered first; re-assigned on disconnect if necessary. It owns plain (unmentioned) messages.
 
@@ -50,9 +56,40 @@ Only one turn runs at a time per session. Additional messages while `activeTurn`
 
 Registered at startup. The agent calls this with local file paths during a turn; paths are pushed onto `activeTurn.queuedAttachments` and sent after the final reply in `agent_end`. Plain-text mention of a path will NOT send the file — the system prompt suffix states this.
 
+### The `telegram_delegate` tool (leader-only, non-blocking)
+
+Registered unconditionally but the handler rejects when the session is not the leader. Semantics are **fire-and-forget**: the tool dispatches work and returns immediately so the leader's turn can end and the leader can keep responding to other Telegram messages while the target is working.
+
+Dispatch path (inside the tool handler):
+1. Validate target (leader-only, not self, live session).
+2. Generate a `correlationId`, post `→ @target: <task excerpt>` status line.
+3. Append a delegation-flavored `InboxMessage` to `inbox/<target>.jsonl` with `{ correlationId, fromSession, replyChannel }`.
+4. Register a `PendingDelegation { correlationId, target, task, startedAt, timeoutSec, timeoutHandle, chatId }` in an in-memory `pendingDelegations` Map.
+5. Return `{ status: "dispatched", target, correlationId }` to the agent synchronously — no `await`.
+
+Result path (outside the tool, asynchronous):
+- The target session's `agent_end` posts its full Telegram reply (with `--<target>` footer) and appends a `ReplyRecord` to `replies/<leader>.jsonl`.
+- The leader's reply-channel watcher (`REPLY_POLL_INTERVAL_MS = 1000`) drains records, looks up `correlationId`, and calls `onDelegationResult(...)`.
+- `onDelegationResult` posts the closing status line (`✓ / ⚠ / ⏱`), logs a `RESULT` entry, and **injects a synthetic user message** into the leader's own pi session via `dispatchToLocalAgent`. Prefixes:
+  - `[delegation-reply from @target] (task: "…")\n\n<result text>`
+  - `[delegation-error from @target] (task: "…")\n\n<error>`
+  - `[delegation-timeout from @target] (task: "…")\n\nno reply after Xs`
+
+Because injection goes through `dispatchToLocalAgent`, a result arriving while the leader is in another turn queues naturally via `leaderQueue` — FIFO, no special handling.
+
+Timeouts default to 600 s (`DEFAULT_DELEGATE_TIMEOUT_S`) and are overridable per call; they fire the same injection path with status `timeout`. On `stopPolling`, the watcher and all timeout handles are cleared; in-flight delegations on target sessions keep running, and any replies that arrive after leadership changes are dropped (logged, no crash).
+
+### Ambient pending-delegations state
+
+On every leader turn, `before_agent_start` appends a `Pending delegations (N):` block (or `Pending delegations: (none)`) rendered from the live `pendingDelegations` map. The agent treats this as the authoritative source of what's in flight — it never has to "remember" outstanding work across turn boundaries, including turns triggered by user interjections while delegations are pending. Capped at 20 entries (`MAX_PENDING_IN_PROMPT`); overflow shown as "… and N more".
+
+### Orchestration log
+
+`lib/history.ts` appends entries to `~/.pi/agent/telegram-multi/orchestration-log.md` on turn start, each delegation, and turn end. All writes are best-effort (errors swallowed). The leader's system prompt tells the agent where to look.
+
 ### Reply formatting
 
-All final replies are wrapped by `signReply` → `"<b>[session-name]</b>\n" + markdown→HTML`. `rendering.ts:renderMarkdownToHtml` is a hand-rolled minimal converter (bold/italic/code/links/headers only). Messages over 4096 chars are split by `chunkMessage` preferring paragraph, then newline, then hard-cut boundaries.
+Final replies are built by `rendering.ts:buildReplyChunks(sessionName, markdown)`, which renders markdown→HTML once, chunks it with the HTML-aware `chunkMessage` (preserves tag balance across chunks, never splits inside tags/entities/surrogate pairs), and appends a trailing `--session_name` footer — with `(i/N)` pagination when multi-chunk. Streaming previews use `buildPreview` (same footer, single bubble edited in place). `renderMarkdownToHtml` is a hand-rolled minimal converter supporting bold/italic/code/links/headers.
 
 ## Config
 

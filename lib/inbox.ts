@@ -17,6 +17,17 @@ export interface InboxMessage {
   text: string;
   files: InboxFile[];
   timestamp: number;
+  /**
+   * Set when the message originated from another session's `delegate` tool
+   * rather than directly from Telegram. The recipient's `agent_end` should
+   * write its final reply to `replies/<replyChannel>.jsonl` so the delegator
+   * can resolve its pending tool-call promise.
+   */
+  delegation?: {
+    correlationId: string;
+    fromSession: string;
+    replyChannel: string;
+  };
 }
 
 export interface InboxFile {
